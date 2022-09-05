@@ -1,0 +1,1 @@
+from froid.pipelines.train import train

@@ -1,0 +1,2 @@
+class FroidError(Exception):
+    pass
