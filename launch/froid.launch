@@ -1,0 +1,8 @@
+<launch>
+    <node
+        name="tello"
+        pkg="froid"
+        type="tello"
+        output="screen">
+    </node>
+</launch>

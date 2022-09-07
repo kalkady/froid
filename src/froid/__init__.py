@@ -1,6 +1,4 @@
-
 from __future__ import absolute_import
-
 
 try:
     import os
@@ -39,9 +37,7 @@ def get_version_str():
     version = "%s%s" % (__version__, " (%s)" % __build__ if __build__ else "")
     return version
 
+# import deeply
 
-
-import deeply
-
-dops = deeply.ops.service("wandb")
-dops.init("froid")
+# dops = deeply.ops.service("wandb")
+# dops.init("froid")
