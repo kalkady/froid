@@ -8,38 +8,75 @@ class TelloError(Exception):
     pass
 
 class Tello(BaseObject):
+    _STATE_PROPS = (
+        "roll",
+        "yaw",
+        "battery",
+        "height",
+        "flight_time",
+        "barometer",
+    )
+
     def __init__(self, *args, **kwargs):
+        docker = kwargs.pop("docker", False)
+        DJITelloPy.DOCKER = docker
+
         self._tello  = DJITelloPy(*args, **kwargs)
         self._logger = get_logger("tello")
 
-        self._is_connected = False
+        self._state  = { }
 
     @property
     def connected(self):
-        return self._is_connected
+        return self._state.get("connected")
 
-    def _get_state(self, type_):
-        fn_name = "get_%s" % type_
+    @property
+    def frame(self):
+        frame_read = self._exec_command(self._tello.get_frame_read,
+            before_cmd_log = "Fetching frame read...",
+            after_cmd_log  = "Frame read fetched."
+        )
+        frame = frame_read.frame
+
+        return frame
+
+    def _set_tello_state_props(self):
+        for attr in self._STATE_PROPS:
+            setattr(self, attr, property(self._get_state(attr)))
+
+    def _get_state(self, attr):
+        self._check_connected()
+
+        fn_name = "get_%s" % attr
         fn_attr = getattr(self._tello, fn_name, None)
 
         if not fn_attr:
-            raise ValueError("No state %s found." % type_)
+            raise ValueError("No state %s found." % attr)
 
         return fn_attr()
 
-    @property
-    def battery(self):
-        return self._get_state("battery")
+    def _set_state(self, state, value):
+        self._state[state] = value
 
     def connect(self, *args, **kwargs):
+        stream_on = kwargs.pop("stream_on", False)
+
         def _connect():
             self._tello.connect(*args, **kwargs)
-            self._is_connected = True
+            self._set_state("connected", True)
 
         self._exec_command(_connect,
             before_cmd_log = "Connecting...",
             after_cmd_log  = "Connected."
         )
+
+        self._set_tello_state_props()
+
+        if stream_on:
+            self._exec_command(self._tello.streamon,
+                before_cmd_log = "Turning camera on...",
+                after_cmd_log  = "Camera ready."
+            )
 
     def _check_connected(self, raise_err = True):
         connected = self.connected
@@ -64,10 +101,12 @@ class Tello(BaseObject):
         for log in before_cmd_log:
             self._logger.info(log)
         
-        cmd()
+        result = cmd()
 
         for log in after_cmd_log:
             self._logger.success(log)
+
+        return result
 
     def takeoff(self):
         self._exec_command(self._tello.takeoff,
