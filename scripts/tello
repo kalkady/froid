@@ -11,7 +11,7 @@ logger = get_logger(NAME)
         
 node   = ezros.Node("tello")
 tello  = Tello(docker = True)
-tello.connect(wait_for_state = False, stream_on = True)
+tello.connect(wait_for_state = True, stream_on = False)
 
 @node.on("/takeoff", mtype = None)
 def handle_takeoff(msg):
@@ -21,18 +21,16 @@ def handle_takeoff(msg):
 def handle_land(msg):
     tello.land()
 
-@node.pub("/state", mtype = "froid.msg.TelloState")
+@node.pub("/state", rate = 1, mtype = "froid.msg.TelloState")
 def handle_state(msg):
     for attr in Tello._STATE_PROPS:
-        setattr(msg, attr, getattr(tello, attr))
+        setattr(msg, attr, getattr(tello, attr)())
     return msg
 
-@node.pub("/frame", mtype = "froid.msg.TelloFrame")
+@node.pub("/frame", rate = 1, mtype = "froid.msg.TelloFrame")
 def handle_frame(msg):
     frame = tello.frame
-
     msg.data = frame.tobytes()
-
     return msg
 
 if __name__ == "__main__":

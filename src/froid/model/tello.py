@@ -1,6 +1,7 @@
 from bpyutils.model.base import BaseObject
 from bpyutils.util.array import sequencify
 from bpyutils.log import get_logger
+from bpyutils._compat import iteritems
 
 from djitellopy import Tello as DJITelloPy
 
@@ -8,14 +9,14 @@ class TelloError(Exception):
     pass
 
 class Tello(BaseObject):
-    _STATE_PROPS = (
-        "roll",
-        "yaw",
-        "battery",
-        "height",
-        "flight_time",
-        "barometer",
-    )
+    _STATE_PROPS = {
+        "roll": None,
+        "yaw": None,
+        "battery": None,
+        "height": None,
+        "flight_time": None,
+        "barometer": None,
+    }
 
     def __init__(self, *args, **kwargs):
         docker = kwargs.pop("docker", False)
@@ -40,9 +41,16 @@ class Tello(BaseObject):
 
         return frame
 
-    def _set_tello_state_props(self):
-        for attr in self._STATE_PROPS:
-            setattr(self, attr, property(self._get_state(attr)))
+    def _set_tello_state_fns(self):
+        for attr, conf in iteritems(Tello._STATE_PROPS):
+            if not conf:
+                conf = { "type": int }
+            else:
+                if "type" not in conf:
+                    conf["type"] = int
+            
+            setattr(self, attr, lambda c=conf, a=attr:
+                conf["type"](self._get_state(a)))
 
     def _get_state(self, attr):
         self._check_connected()
@@ -70,7 +78,7 @@ class Tello(BaseObject):
             after_cmd_log  = "Connected."
         )
 
-        self._set_tello_state_props()
+        self._set_tello_state_fns()
 
         if stream_on:
             self._exec_command(self._tello.streamon,
