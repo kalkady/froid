@@ -1,13 +1,8 @@
 #!/usr/bin/env python
 
-from bpyutils.log import get_logger
-
 import ezros
 
-from froid.__attr__ import __name__ as NAME
 from froid.model.tello import Tello
-
-logger = get_logger(NAME)
         
 node   = ezros.Node("tello")
 tello  = Tello(docker = True)

@@ -1,0 +1,17 @@
+#!/usr/bin/env python
+
+import ezros
+
+tello = ezros.Node("tello")
+node  = ezros.Node("froid")
+
+# @node.on("/takeoff", mtype = None)
+# def handle_takeoff(msg):
+#     pass
+
+@node.on("/frame", mtype = "froid.msg.TelloFrame")
+def handle_frame(msg):
+    pass
+
+if __name__ == "__main__":
+    node.run()

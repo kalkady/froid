@@ -1,0 +1,287 @@
+#!/usr/bin/env python
+
+import os, os.path as osp
+import argparse
+import random
+import json
+
+import numpy as np
+import cv2
+import tqdm as tq
+
+from bpyutils.util.array  import sequencify
+from bpyutils.util.string import get_random_str
+from bpyutils.util.system import (check_path, get_files, make_temp_dir, read, write,
+    makedirs)
+from bpyutils.util.types  import build_fn
+from bpyutils.util.error  import pretty_print_error
+from bpyutils.log import get_logger
+from bpyutils.const import CPU_COUNT
+from bpyutils import parallel
+
+# TODO
+# - Add config file support
+
+logger = get_logger(__file__)
+
+DEFAULT = {
+    "chess_board_grid_shape": (9, 6),
+    "chess_board_corner_searh_size": (5, 5),
+    "max_points": 20,
+    "frame_rate": 20,
+    "jobs": CPU_COUNT
+}
+
+def get_parser():
+    parser = argparse.ArgumentParser(description='Camera Calibration')
+    parser.add_argument('--image', '-i', type=check_path, nargs = '+',
+                        help='Input Image File')
+    parser.add_argument('--image-dir', type = check_path,
+                        help='Path to the directory containing the images to be used for calibration.')
+    parser.add_argument('--video', '-v', type=check_path,
+                        help='Input Video File')
+    parser.add_argument('--undistort', '-u', type=check_path,
+                        help='Undistort Image/Video')
+    parser.add_argument('--output', '-o', type=check_path,
+                        help='Output File')
+    parser.add_argument('--config', '-c', type=check_path,
+                        help='Config File')
+    parser.add_argument('--jobs', '-j', type=int, default = DEFAULT["jobs"],
+                        help='Number of jobs to use for parallel processing')
+    return parser
+
+def norm_frame(frame):
+    if isinstance(frame, str):
+        frame = cv2.imread(frame)
+
+    w, h = frame.shape[:2]
+
+    return h, w, frame
+
+def preprocess_and_parallelize(input_, fn, jobs = DEFAULT["jobs"], *args, **kwargs):
+    frames   = sequencify(input_)
+
+    n_frames = len(frames)
+
+    logger.info("Processing %s frames..." % n_frames)
+
+    with parallel.no_daemon_pool(processes = jobs) as pool:
+        fn = build_fn(fn, *args, **kwargs)
+        results = list(tq.tqdm(pool.map(fn, frames), total = n_frames, desc = "Processing Frames"))
+
+    return n_frames, results
+
+def get_reprojection_error(object_points, image_points, rvecs, tvecs, camera_matrix, dist_coeffs):
+    total_error = 0
+    size = len(object_points)
+
+    for i in tq.tqdm(range(size), desc = "Calculating Reprojection Error"):
+        image_points2, _ = cv2.projectPoints(object_points[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
+        error = cv2.norm(image_points[i], image_points2, cv2.NORM_L2) / len(image_points2)
+        total_error += error
+    
+    return total_error / size
+
+def calibrate_frame(frame,
+    grid_shape = DEFAULT["chess_board_grid_shape"],
+    corner_search_size = DEFAULT["chess_board_corner_searh_size"]
+):
+    h, w, frame = norm_frame(frame)
+
+    data  = { "object": None, "image": None, "w": w, "h": h }
+
+    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    found_corners, corners = cv2.findChessboardCorners(gray, grid_shape,
+        cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_FAST_CHECK + cv2.CALIB_CB_NORMALIZE_IMAGE)
+
+    if found_corners:
+        object_points = np.zeros((grid_shape[0] * grid_shape[1], 3), np.float32)
+        object_points[:,:2] = np.mgrid[0:grid_shape[0], 0:grid_shape[1]].T.reshape(-1, 2)
+
+        data["object"] = object_points
+
+        corners2 = cv2.cornerSubPix(gray, corners, corner_search_size, (-1, -1), None)
+
+        data["image"]  = corners2
+
+    return data
+
+def calibrate_camera(input_,
+    grid_shape = DEFAULT["chess_board_grid_shape"],
+    corner_search_size = DEFAULT["chess_board_corner_searh_size"],
+    max_points = DEFAULT["max_points"],
+    jobs = DEFAULT["jobs"],
+    output = None
+):
+    object_points = np.zeros((grid_shape[0] * grid_shape[1], 3), np.float32)
+    object_points[:,:2] = np.mgrid[0:grid_shape[0], 0:grid_shape[1]].T.reshape(-1, 2)
+    
+    n_frames, results = preprocess_and_parallelize(input_, fn = calibrate_frame,
+        grid_shape = grid_shape, corner_search_size = corner_search_size, jobs = jobs)
+
+    points = { "object": [], "image": [] }
+    cumulative_shape = [[], []]
+    n_success_frames = 0
+
+    for i, result in enumerate(results):
+        if result["object"] is not None and result["image"] is not None:
+            logger.success("Found chessboard corners in frame %s." % (i + 1))
+
+            points["object"].append(result["object"])
+            points["image"].append(result["image"])
+
+            n_success_frames += 1
+        else:
+            logger.warning("Unable to find chessboard corners in frame %s." % (i + 1))
+
+        cumulative_shape[0].append(result["w"])
+        cumulative_shape[1].append(result["h"])
+
+    logger.success("Chessboard corner success rate %.4f" % (n_success_frames / n_frames))
+
+    mean_shape = np.rint(np.mean(cumulative_shape, axis = 1)).astype(np.int32)
+
+    logger.info("Calibrating Camera...")
+
+    max_points = min(max_points, len(points["object"]))
+
+    logger.info("Choosing %s points..." % max_points)
+    
+    indices = random.sample(range(0, len(points["object"])), max_points)
+
+    sub_select_points = { "object": [], "image": [] }
+    
+    for i in indices:
+        sub_select_points["object"].append(points["object"][i])
+        sub_select_points["image"].append(points["image"][i])
+    
+    _, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(sub_select_points["object"], sub_select_points["image"], mean_shape, None, None)
+
+    error = get_reprojection_error(sub_select_points["object"], sub_select_points["image"], rvecs, tvecs, mtx, dist)
+
+    logger.info("Reprojection Error: %.10f" % error)
+
+    if output is not None:
+        logger.info("Saving calibration to %s..." % output)
+        output_config = {
+            "camera_matrix": mtx.tolist(),
+            "distortion_coefficients": dist.tolist(),
+        }
+
+        write(output, json.dumps(output_config))
+
+def undistort_frame(frame, cam_mtx, dist_coeff):
+    h, w, frame = norm_frame(frame)
+
+    new_cam_mtx, roi = cv2.getOptimalNewCameraMatrix(cam_mtx, dist_coeff, (w, h), 1, (w, h))
+
+    img = cv2.undistort(frame, cam_mtx, dist_coeff, None, new_cam_mtx)
+
+    x, y, w, h = roi
+    img = img[y:y+h, x:x+w]
+
+    return img
+
+def undistort_images(input_, cam_mtx, dist_coeff, video = False,
+    frame_rate  = DEFAULT["frame_rate"],
+    video_shape = None,
+    jobs   = DEFAULT["jobs"],
+    output = None
+):
+    output_dir = output or osp.join(os.getcwd(), "undistorted")
+
+    _, results = preprocess_and_parallelize(input_, fn = undistort_frame,
+        cam_mtx = np.asarray(cam_mtx), dist_coeff = np.asarray(dist_coeff), jobs = jobs)
+
+    makedirs(output_dir, exist_ok = True)
+
+    hash_  = get_random_str(length = 5)
+
+    video_writer = None
+
+    if video:
+        if not video_shape:
+            raise ValueError("Video shape must be specified.")
+
+        path = osp.join(output_dir, "undistorted_%s.avi" % hash_)
+        video_writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"MJPG"), frame_rate, video_shape)
+
+    for i, img in enumerate(results):
+        if video:
+            logger.info("Writing video frame %s" % i)
+            video_writer.write(img)
+        else:
+            path = osp.join(output_dir, "frame_%s_%s.png" % (hash_, i))
+            logger.info("Writing frame %s" % path)
+            cv2.imwrite(path, img)
+
+    if video_writer:
+        video_writer.release()
+
+    logger.success("Saved to %s (%s)." % (output_dir, hash_))
+
+def main():
+    """
+        main entry point for the program
+    """
+    # parse the command line arguments
+    parser = get_parser()
+    args   = parser.parse_args()
+
+    images = args.image or []
+    output = args.output
+    undistort_config = args.undistort
+
+    frame_rate  = DEFAULT["frame_rate"]
+    video_shape = None
+
+    if args.image_dir:
+        # get all the images in the directory
+        files   = get_files(args.image_dir)
+        images += files
+
+    with make_temp_dir() as tmp_dir:
+        # if the user specified a video, extract the frames
+        if args.video:
+            capture = cv2.VideoCapture(args.video)
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            frame_rate  = capture.get(cv2.CAP_PROP_FPS)
+            video_shape = (int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            
+            # extract the frames
+            for i in tq.tqdm(range(frame_count), desc = "Extracting Frames"):
+                ret, frame = capture.read()
+
+                if not ret:
+                    logger.error("Error reading frame %s from video %s", i, args.video)
+                else:
+                    path = osp.join(tmp_dir, "frame_%s.png" % get_random_str())
+
+                    cv2.imwrite(path, frame)
+                    images.append(path)
+
+        try:
+            if args.undistort:
+                undistort_config = json.loads(read(args.undistort))
+            else:
+                if not output:
+                    output = "camera_calibration_%s.json" % get_random_str(length = 5)
+
+            if undistort_config:
+                undistort_images(images, cam_mtx = undistort_config["camera_matrix"],
+                    dist_coeff = undistort_config["distortion_coefficients"], video = False and bool(args.video),
+                    frame_rate = frame_rate, video_shape = video_shape,
+                    output = output, jobs = args.jobs)
+            else:
+                calibrate_camera(images,
+                    max_points = DEFAULT["max_points"], output = output, jobs = args.jobs)
+        except Exception as e:
+            pretty_print_error(e)
+
+if __name__ == '__main__':
+    # called from command line
+    try:
+        main()
+    except Exception as e:
+        pretty_print_error(e)
